@@ -228,50 +228,43 @@ fm_list_model_get_value (GtkTreeModel *tree_model, GtkTreeIter *iter, int column
     file_entry = g_sequence_get (iter->user_data);
     file = file_entry->file;
 
+    g_return_if_fail (file != NULL && GOF_IS_FILE (file));
+
     switch (column) {
     case FM_LIST_MODEL_FILE_COLUMN:
         g_value_init (value, GOF_TYPE_FILE);
-        if (file != NULL && GOF_IS_FILE(file))
-            g_value_set_object (value, file);
+        g_value_set_object (value, file);
         break;
 
     case FM_LIST_MODEL_COLOR:
         g_value_init (value, G_TYPE_STRING);
-        if (file != NULL)
-            g_value_set_string(value, GOF_PREFERENCES_TAGS_COLORS[file->color]);
+        g_value_set_string(value, GOF_PREFERENCES_TAGS_COLORS[file->color]);
         break;
 
     case FM_LIST_MODEL_FILENAME:
         g_value_init (value, G_TYPE_STRING);
-        if (file != NULL)
-            g_value_set_string(value, gof_file_get_display_name (file));
+        g_value_set_string(value, gof_file_get_display_name (file));
         break;
 
     case FM_LIST_MODEL_SIZE:
         g_value_init (value, G_TYPE_STRING);
-        if (file != NULL)
-            g_value_set_string(value, file->format_size);
+        g_value_set_string(value, file->format_size);
         break;
 
     case FM_LIST_MODEL_TYPE:
         g_value_init (value, G_TYPE_STRING);
-        if (file != NULL)
-            g_value_set_string(value, file->formated_type);
+        g_value_set_string(value, file->formated_type);
         break;
 
     case FM_LIST_MODEL_MODIFIED:
         g_value_init (value, G_TYPE_STRING);
-        if (file != NULL)
-            g_value_set_string(value, file->formated_modified);
+        g_value_set_string(value, file->formated_modified);
         break;
 
     case FM_LIST_MODEL_PIXBUF:
         g_value_init (value, GDK_TYPE_PIXBUF);
-        if (file != NULL) {
-            gof_file_update_icon (file, model->details->icon_size);
-            if (file->pix != NULL)
-                g_value_set_object(value, file->pix);
-        }
+        /* Not model's job (and unnecessary) to update icon here*/
+        g_value_set_object(value, file->pix);
         break;
 
     }
