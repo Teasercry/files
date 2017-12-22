@@ -660,11 +660,9 @@ gof_file_update_icon_internal (GOFFile *file, gint size)
  */
 void gof_file_update_icon (GOFFile *file, gint size)
 {
-    if (size <= 1)
+    if (file->pix != NULL && file->pix_size == size) {
         return;
-
-    if (!(file->pix == NULL || file->pix_size != size))
-        return;
+    }
 
     gof_file_update_icon_internal (file, size);
 }
