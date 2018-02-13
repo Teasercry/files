@@ -22,6 +22,13 @@
 namespace Marlin.Places {
     public class Sidebar : Marlin.AbstractSidebar {
 
+        private struct PendingLoad {
+            Volume volume;
+            Marlin.OpenFlag flag;
+        }
+
+        private PendingLoad? current_pending = null;
+
         enum PlaceType {
             BUILT_IN,
             MOUNTED_VOLUME,
@@ -98,9 +105,6 @@ namespace Marlin.Places {
         Gtk.MenuItem popupmenu_eject_item;
         Gtk.MenuItem popupmenu_empty_trash_item;
         Gtk.MenuItem popupmenu_drive_property_item;
-
-        /* volume mounting - delayed open process */
-        bool mounting = false;
 
         /* prevent multiple unmount processes */
         bool ejecting_or_unmounting = false;
@@ -1269,12 +1273,14 @@ namespace Marlin.Places {
         private void open_selected_bookmark (Gtk.TreeModel model,
                                              Gtk.TreePath path,
                                              Marlin.OpenFlag open_flag) {
-            if (path == null)
+            if (path == null) {
                 return;
-
+            }
+warning ("open boolmark");
             Gtk.TreeIter iter;
-            if (!store.get_iter (out iter, path))
+            if (!store.get_iter (out iter, path)) {
                 return;
+            }
 
             string? uri = null;
             Marlin.PluginCallbackFunc? f = null;
@@ -1284,7 +1290,7 @@ namespace Marlin.Places {
                 path_change_request (uri, open_flag);
             } else if (f != null) {
                 f (this);
-            } else if (!ejecting_or_unmounting) {
+            } else if (!ejecting_or_unmounting && current_pending == null) {
                 Drive drive;
                 Volume volume;
 
@@ -1293,45 +1299,56 @@ namespace Marlin.Places {
                             Column.DRIVE, out drive,
                             Column.VOLUME, out volume);
 
-                if (volume != null && !mounting)
+                if (volume != null) {
                     mount_volume (volume, mount_op, open_flag);
+                } else if (drive != null &&
+                           volume == null &&
+                           (drive.can_start () || drive.can_start_degraded ())) {
 
-                else if (drive != null && volume == null
-                        && (drive.can_start () || drive.can_start_degraded ()))
                     start_drive (drive, mount_op);
+                }
             }
         }
 
         private void mount_volume (Volume volume, Gtk.MountOperation mount_op, Marlin.OpenFlag flags) {
-            mounting = true;
+warning ("mount vol");
+            if (current_pending != null) {
+                return;
+            }
+
+            current_pending = {volume, flags};
+
+            /* Ensure mounting will not block indefinitely */
+            Timeout.add_seconds (15, () => {
+                if (current_pending != null) {
+                    on_failed_mount (volume, _("No mount found before timed out"));
+                }
+
+                current_pending = null;
+                return false;
+            });
+
             volume.mount.begin (GLib.MountMountFlags.NONE,
                                 mount_op,
                                 null,
                                 (obj, res) => {
                 try {
-                    mounting = false;
                     volume.mount.end (res);
-                    Mount mount = volume.get_mount ();
-                    if (mount != null) {
-                        var location = mount.get_root ();
-                        if (flags == Marlin.OpenFlag.NEW_WINDOW) {
-                            var app = Marlin.Application.get ();
-                            app.create_window (location);
-                        } else if (flags == Marlin.OpenFlag.NEW_TAB) {
-                            window.open_single_tab (location, Marlin.ViewMode.CURRENT);
-                        } else {
-                            window.uri_path_change_request (location.get_uri ());
-                        }
-                    }
                 }
                 catch (GLib.Error error) {
-                    var primary = _("Error mounting volume %s").printf (volume.get_name ());
-                    Eel.show_error_dialog (primary, error.message, null);
+                    on_failed_mount (volume, error.message);
                 }
             });
         }
 
+        private void on_failed_mount (Volume volume, string message) {
+            current_pending = null;
+            var primary = _("Error mounting volume %s").printf (volume.get_name ());
+            Eel.show_error_dialog (primary, message, null);
+        }
+
         private void start_drive (Drive drive, Gtk.MountOperation mount_op) {
+warning ("starting drive");
             drive.start.begin (DriveStartFlags.NONE,
                                mount_op,
                                null,
@@ -2142,7 +2159,26 @@ namespace Marlin.Places {
 
         private void mount_added_callback (Mount mount) {
             update_places ();
+            var vol = mount.get_volume ();
+            if (vol != null && current_pending != null && vol == current_pending.volume) {
+                var location = mount.get_root ();
+                switch (current_pending.flag) {
+                    case Marlin.OpenFlag.NEW_WINDOW:
+                        var app = Marlin.Application.get ();
+                        app.create_window (location);
+                        break;
+                    case Marlin.OpenFlag.NEW_TAB:
+                        window.open_single_tab (location, Marlin.ViewMode.CURRENT);
+                        break;
+                    default:
+                        window.uri_path_change_request (location.get_uri ());
+                        break;
+                }
+            }
+
+            current_pending = null;
         }
+
         private void mount_removed_callback (Mount mount) {
             update_places ();
         }
