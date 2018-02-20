@@ -106,8 +106,8 @@ namespace Marlin.Places {
         Gtk.MenuItem popupmenu_empty_trash_item;
         Gtk.MenuItem popupmenu_drive_property_item;
 
-        /* prevent multiple unmount processes */
-        bool ejecting_or_unmounting = false;
+        /* prevent multiple mount/unmount processes */
+        bool mount_op_in_progress = false;
 
         /* TODO Make it an option in Settings whether or not to show
          * bookmarks pointing to non-existent (or unmounted) files. */
@@ -333,20 +333,6 @@ namespace Marlin.Places {
             volume_monitor.drive_disconnected.connect (drive_disconnected_callback);
             volume_monitor.drive_changed.connect (drive_connected_callback);
             volume_monitor.drive_changed.connect (drive_changed_callback);
-        }
-        private void disconnect_volume_monitor_signals () {
-            volume_monitor = GLib.VolumeMonitor.@get ();
-            volume_monitor.volume_added.disconnect (volume_added_callback);
-            volume_monitor.volume_removed.disconnect (volume_removed_callback);
-            volume_monitor.volume_changed.disconnect (volume_changed_callback);
-
-            volume_monitor.mount_added.disconnect (mount_added_callback);
-            volume_monitor.mount_removed.disconnect (mount_removed_callback);
-            volume_monitor.mount_changed.disconnect (mount_changed_callback);
-
-            volume_monitor.drive_disconnected.disconnect (drive_disconnected_callback);
-            volume_monitor.drive_changed.disconnect (drive_connected_callback);
-            volume_monitor.drive_changed.disconnect (drive_changed_callback);
         }
 
         private void set_up_theme () {
@@ -1276,7 +1262,7 @@ namespace Marlin.Places {
             if (path == null) {
                 return;
             }
-warning ("open boolmark");
+
             Gtk.TreeIter iter;
             if (!store.get_iter (out iter, path)) {
                 return;
@@ -1290,78 +1276,91 @@ warning ("open boolmark");
                 path_change_request (uri, open_flag);
             } else if (f != null) {
                 f (this);
-            } else if (!ejecting_or_unmounting && current_pending == null) {
+            } else if (!mount_op_in_progress && current_pending == null) {
                 Drive drive;
                 Volume volume;
 
-                var mount_op = new Gtk.MountOperation (window);
+
                 store.@get (iter,
                             Column.DRIVE, out drive,
                             Column.VOLUME, out volume);
 
+                start_spinner (path);
+
                 if (volume != null) {
-                    mount_volume (volume, mount_op, open_flag);
+                    mount_volume (volume, open_flag);
                 } else if (drive != null &&
                            volume == null &&
                            (drive.can_start () || drive.can_start_degraded ())) {
 
-                    start_drive (drive, mount_op);
+                    start_drive (drive);
                 }
             }
         }
 
-        private void mount_volume (Volume volume, Gtk.MountOperation mount_op, Marlin.OpenFlag flags) {
-warning ("mount vol");
+        private void mount_volume (Volume volume, Marlin.OpenFlag flags) {
             if (current_pending != null) {
                 return;
             }
+
+            var mount_op = new Gtk.MountOperation (window);
+            mount_op.set_password_save (GLib.PasswordSave.FOR_SESSION);
+            var cancellable = new Cancellable ();
 
             current_pending = {volume, flags};
 
             /* Ensure mounting will not block indefinitely */
             Timeout.add_seconds (15, () => {
+                cancellable.cancel ();
                 if (current_pending != null) {
-                    on_failed_mount (volume, _("No mount found before timed out"));
+                    failed_mount_op (_("Failed to mount %s").printf (volume.get_name ()),
+                                     new GLib.Error (IOError.quark (),
+                                                     0, // Not used by function called so value irrelevant
+                                                     _("Timed out")));
+                    current_pending = null;
                 }
 
-                current_pending = null;
                 return false;
             });
 
             volume.mount.begin (GLib.MountMountFlags.NONE,
                                 mount_op,
-                                null,
+                                cancellable,
                                 (obj, res) => {
                 try {
                     volume.mount.end (res);
-                }
-                catch (GLib.Error error) {
-                    on_failed_mount (volume, error.message);
+                    /* According documentation, the mount should be available at this point
+                     * and waiting for the mount-added signal should not be necessary.  However,
+                     * this is not necessarily the case for encrypted mounts.  Hence the use of
+                     * the current_pending struct, which will be used by the mount-added event
+                     * handler.
+                     */
+                } catch (GLib.Error error) {
+                    if (!(error is IOError.CANCELLED)) {
+                        failed_mount_op (_("Unable to mount %s").printf (volume.get_name ()), error);
+                    }
+                } finally {
+                    finish_mount_op ();
                 }
             });
         }
 
-        private void on_failed_mount (Volume volume, string message) {
-            current_pending = null;
-            var primary = _("Error mounting volume %s").printf (volume.get_name ());
-            Eel.show_error_dialog (primary, message, null);
-        }
+        private void start_drive (Drive drive) {
+            var mount_op = new Gtk.MountOperation (window);
+            mount_op.set_password_save (GLib.PasswordSave.FOR_SESSION);
 
-        private void start_drive (Drive drive, Gtk.MountOperation mount_op) {
-warning ("starting drive");
             drive.start.begin (DriveStartFlags.NONE,
                                mount_op,
                                null,
                                (obj, res) => {
                     try {
                         drive.start.end (res);
+                    } catch (GLib.Error error) {
+                        failed_mount_op (_("Unable to start %s").printf (drive.get_name ()), error);
+                    } finally {
+                        finish_mount_op ();
                     }
-                    catch (GLib.Error error) {
-                            var primary = _("Unable to start %s").printf (drive.get_name ());
-                            Eel.show_error_dialog (primary, error.message, null);
-                    }
-                }
-            );
+            });
         }
 
         private void rename_selected_bookmark () {
@@ -1833,17 +1832,15 @@ warning ("starting drive");
 
 /* MOUNT UNMOUNT AND EJECT FUNCTIONS */
 
-         private void do_unmount (Mount? mount, Gtk.TreeRowReference? row_ref = null, bool can_eject = false) {
-            /* Ignore signals generated by our own eject and unmount actins */
-            disconnect_volume_monitor_signals ();
-
+         private void do_unmount (Mount? mount, bool can_eject) {
             if (mount == null) {
-                finish_eject_or_unmount (row_ref, false);
+                finish_mount_op ();
                 return;
             }
+
             /* Do not offer to empty trash every time - this can be done
              * from the context menu if needed */
-            ejecting_or_unmounting = true;
+            mount_op_in_progress = true;
             var volume = mount.get_volume ();
 
             GLib.MountOperation mount_op = new Gtk.MountOperation (window as Gtk.Window);
@@ -1855,16 +1852,16 @@ warning ("starting drive");
                 try {
                     success = mount.unmount_with_operation.end (res);
                     if (success && can_eject) {
-                        /* Eject associated volume after unmount if appropriate.
-                         * Keep volume monitor disconnected */
-                        do_eject (null, volume, null, row_ref);
+                        /* Eject associated volume after unmount if appropriate.*/
+                        do_eject (null, volume, null);
                     } else {
-                        finish_eject_or_unmount (row_ref, success);
+                        finish_mount_op ();
                     }
-                }
-                catch (GLib.Error error) {
-                    debug ("Error while unmounting");
-                    finish_eject_or_unmount (row_ref, false);
+                } catch (GLib.Error error) {
+                    failed_mount_op ("An error occurred while unmounting %s".printf (mount.get_name ()),
+                                   error);
+                } finally {
+                    finish_mount_op ();
                 }
             });
          }
@@ -1891,7 +1888,7 @@ warning ("starting drive");
                 store.get_iter (out iter, path);
                 store.@get (iter, Column.CAN_EJECT, out show_eject);
 
-                if (!show_eject || ejecting_or_unmounting)
+                if (!show_eject || mount_op_in_progress)
                     return false;
 
                 tree_view.style_get ("horizontal-separator", out hseparator, null);
@@ -1907,13 +1904,14 @@ warning ("starting drive");
             return false;
         }
 
-        private void do_eject (GLib.Mount? mount, GLib.Volume? volume, GLib.Drive? drive, Gtk.TreeRowReference? row_ref = null) {
-            /* Ignore signals generated by our own eject and unmount actins */
-            disconnect_volume_monitor_signals ();
+        private void do_eject (GLib.Mount? mount,
+                               GLib.Volume? volume,
+                               GLib.Drive? drive) {
 
             GLib.MountOperation mount_op = new GLib.MountOperation ();
+
             if (drive != null) {
-                ejecting_or_unmounting = true;
+                mount_op_in_progress = true;
                 drive.eject_with_operation.begin (GLib.MountUnmountFlags.NONE,
                                                   mount_op,
                                                   null,
@@ -1921,17 +1919,14 @@ warning ("starting drive");
                     bool success = false;
                     try {
                         success = drive.eject_with_operation.end (res);
+                    } catch (GLib.Error error) {
+                        failed_mount_op ("Error ejecting drive", error);
+                    } finally {
+                        finish_mount_op ();
                     }
-                    catch (GLib.Error error) {
-                        warning ("Error ejecting drive: %s", error.message);
-                    }
-                    finish_eject_or_unmount (row_ref, success);
                 });
-                return;
-            }
-
-            if (volume != null) {
-                ejecting_or_unmounting = true;
+            } else if (volume != null) {
+                mount_op_in_progress = true;
                 volume.eject_with_operation.begin (GLib.MountUnmountFlags.NONE,
                                                    mount_op,
                                                    null,
@@ -1939,17 +1934,14 @@ warning ("starting drive");
                     bool success = false;
                     try {
                         success = volume.eject_with_operation.end (res);
+                    } catch (GLib.Error error) {
+                        failed_mount_op ("Error ejecting volume", error);
+                    } finally {
+                        finish_mount_op ();
                     }
-                    catch (GLib.Error error) {
-                        warning ("Error ejecting volume: %s", error.message);
-                    }
-                    finish_eject_or_unmount (row_ref, success);
                 });
-                return;
-            }
-
-            if (mount != null) {
-                ejecting_or_unmounting = true;
+            } else if (mount != null) {
+                mount_op_in_progress = true;
                 mount.eject_with_operation.begin (GLib.MountUnmountFlags.NONE,
                                                   mount_op,
                                                   null,
@@ -1959,35 +1951,56 @@ warning ("starting drive");
                         success = mount.eject_with_operation.end (res);
                     }
                     catch (GLib.Error error) {
-                        warning ("Error ejecting mount: %s", error.message);
+                        failed_mount_op ("Error ejecting mount", error);
                     }
-                    finish_eject_or_unmount (row_ref, success);
+
+                    finish_mount_op ();
                 });
-                return;
+            } else {
+                finish_mount_op ();
             }
-            finish_eject_or_unmount (row_ref, false);
         }
 
-        private void finish_eject_or_unmount (Gtk.TreeRowReference? row_ref, bool success) {
-            ejecting_or_unmounting = false;
-            if (row_ref != null && row_ref.valid ()) {
-                Gtk.TreeIter iter;
-                if (store.get_iter (out iter, row_ref.get_path ())) {
-                    store.@set (iter, Column.SHOW_SPINNER, false);
-                    store.@set (iter, Column.SHOW_EJECT, !success); /* continue to show eject if did not succeed */
+        private void failed_mount_op (string primary, GLib.Error error) {
+            update_places ();
+            Eel.show_error_dialog (primary, error.message, window);
+        }
+
+        private void finish_mount_op () {
+            mount_op_in_progress = false;
+        }
+
+        /* Shows that a mount or eject operation in progress - assumes only
+         * one at a time.
+         */
+        private void start_spinner (Gtk.TreePath path) {
+            Gtk.TreeIter? iter = null;
+            store.get_iter (out iter, path);
+            store.@set (iter, Column.SHOW_SPINNER, true);
+            store.@set (iter, Column.SHOW_EJECT, false);
+
+            var rowref = new Gtk.TreeRowReference (store, path);
+            Timeout.add (100, () => {
+                uint val;
+
+                if (!rowref.valid ()) {
+                    /* rowref becomes invalid when store rebuilt after a
+                     * mount operation (whether or not successful) ensuring
+                     * timeout will end */
+                    return false;
+                } else {
+                    store.get_iter (out iter, rowref.get_path ());
                 }
-            }
-            /* Delay reconnecting volume monitor - we do not need to respond to signals consequent on
-             * our own actions that may still be in the pipeline */
-            Timeout.add (300, () => {
-                connect_volume_monitor_signals ();
-                update_places ();
-                return false;
+
+                store.@get (iter, Column.SPINNER_PULSE, out val);
+                store.@set (iter, Column.SPINNER_PULSE, ++val);
+                return true;
             });
         }
 
+
         private bool eject_or_unmount_bookmark (Gtk.TreePath? path, bool allow_eject = true) {
-            if (path == null || ejecting_or_unmounting) {
+            if (path == null || mount_op_in_progress) {
                 return false;
             }
 
@@ -2018,29 +2031,13 @@ warning ("starting drive");
                 return false;
             }
 
-            var rowref = new Gtk.TreeRowReference (store, path);
-            store.@set (iter, Column.SHOW_SPINNER, true);
-            store.@set (iter, Column.SHOW_EJECT, false);
-            Timeout.add (100, ()=>{
-                uint val;
-
-                if (!rowref.valid ())
-                    return false;
-
-                store.@get (iter, Column.SHOW_SPINNER, out spinner_active);
-                if (!spinner_active)
-                    return false;
-
-                store.@get (iter, Column.SPINNER_PULSE, out val);
-                store.@set (iter, Column.SPINNER_PULSE, ++val);
-                return true;
-            });
+            start_spinner (path);
 
             if (can_unmount) {
-                do_unmount (mount, rowref, can_eject && allow_eject);
+                do_unmount (mount, can_eject && allow_eject);
                 /* Drive changed callback will eject the drive if appropriate */
             } else if (can_eject) {
-                do_eject (mount, volume, drive, rowref);
+                do_eject (mount, volume, drive);
             }
             return true;
         }
@@ -2174,9 +2171,13 @@ warning ("starting drive");
                         window.uri_path_change_request (location.get_uri ());
                         break;
                 }
+
+                current_pending = null;
             }
 
-            current_pending = null;
+            /* Timeout set up in mount_volume () will set current_pending to null
+             * if the mount does not get added.
+             */
         }
 
         private void mount_removed_callback (Mount mount) {
@@ -2207,7 +2208,7 @@ warning ("starting drive");
         }
 
         private void drive_changed_callback (VolumeMonitor volume_monitor, Drive drive) {
-            if (ejecting_or_unmounting)
+            if (mount_op_in_progress)
                 return;
 
             if (!drive.is_media_check_automatic ()) {
@@ -2228,7 +2229,7 @@ warning ("starting drive");
             /* Additional checks required because some devices give incorrect results e.g. some MP3 players
              * resulting in them being ejected as soon as plugged in */
             if (drive.is_media_removable () && drive.can_poll_for_media () && !drive.has_media () && drive.can_eject ()) {
-                do_eject (null, null, drive, null);
+                do_eject (null, null, drive);
             }
         }
 
